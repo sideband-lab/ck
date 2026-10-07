@@ -773,17 +773,18 @@ pub fn compute_chunk_hash(
     trailing_trivia: &[String],
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-
-    // Hash the main text
+    // Frame each field so moving bytes between text and trivia, or between
+    // adjacent trivia items, invalidates the embedding cache key.
+    hasher.update(&(text.len() as u64).to_le_bytes());
     hasher.update(text.as_bytes());
-
-    // Hash leading trivia (doc comments, preceding comments)
+    hasher.update(&(leading_trivia.len() as u64).to_le_bytes());
     for trivia in leading_trivia {
+        hasher.update(&(trivia.len() as u64).to_le_bytes());
         hasher.update(trivia.as_bytes());
     }
-
-    // Hash trailing trivia (following comments)
+    hasher.update(&(trailing_trivia.len() as u64).to_le_bytes());
     for trivia in trailing_trivia {
+        hasher.update(&(trivia.len() as u64).to_le_bytes());
         hasher.update(trivia.as_bytes());
     }
 
@@ -1211,6 +1212,41 @@ mod tests {
         fs::write(&file_path, "small content").unwrap();
         let hash3 = compute_file_hash(&file_path).unwrap();
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn chunk_hash_distinguishes_text_and_trivia_boundaries() {
+        let base = compute_chunk_hash("ab", &["c".to_string()], &["d".to_string()]);
+        assert_eq!(
+            base,
+            compute_chunk_hash("ab", &["c".to_string()], &["d".to_string()])
+        );
+        assert_ne!(
+            base,
+            compute_chunk_hash("a", &["bc".to_string()], &["d".to_string()])
+        );
+        assert_ne!(base, compute_chunk_hash("ab", &["cd".to_string()], &[]));
+        assert_ne!(
+            base,
+            compute_chunk_hash("ab", &["c".to_string(), "d".to_string()], &[])
+        );
+    }
+
+    #[test]
+    fn chunk_hash_changes_when_embedding_content_changes() {
+        let base = compute_chunk_hash("fn run() {}", &["/// docs".into()], &["// tail".into()]);
+        assert_ne!(
+            base,
+            compute_chunk_hash("fn stop() {}", &["/// docs".into()], &["// tail".into()])
+        );
+        assert_ne!(
+            base,
+            compute_chunk_hash("fn run() {}", &["/// changed".into()], &["// tail".into()])
+        );
+        assert_ne!(
+            base,
+            compute_chunk_hash("fn run() {}", &["/// docs".into()], &["// changed".into()])
+        );
     }
 
     #[test]
