@@ -120,12 +120,20 @@ fn test_index_command() {
 
     // Test index creation
     let output = ck_command()
-        .args(["--index", "."])
+        .args(["--index", "--model", "minilm", "."])
         .current_dir(temp_dir.path())
         .output()
         .expect("Failed to run ck index");
 
     assert!(output.status.success());
+
+    let manifest_data = fs::read(temp_dir.path().join(".ck/manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_data).unwrap();
+    assert_eq!(
+        manifest["embedding_model"].as_str(),
+        Some("sentence-transformers/all-MiniLM-L6-v2")
+    );
+    assert_eq!(manifest["embedding_dimensions"].as_u64(), Some(384));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
@@ -253,25 +261,22 @@ fn test_semantic_search() {
 
     // Test semantic search - should rank AI content higher for "neural networks"
     let output = ck_command()
-        .args(["--sem", "neural networks", "."])
+        .args(["--sem", "neural networks", "--threshold", "0", "."])
         .current_dir(temp_dir.path())
         .output()
         .expect("Failed to run ck semantic search");
 
-    // Semantic search requires models which might not be available in test environment
-    // So we just check if it runs without crashing
-    if output.status.success() {
-        let stdout = String::from_utf8(output.stdout).unwrap();
-
-        // If we got results, AI file should appear due to semantic similarity
-        let lines: Vec<&str> = stdout.trim().lines().collect();
-        if !lines.is_empty() {
-            // Check that we got some output
-            assert!(!stdout.is_empty());
-        }
-    }
-    // Note: Semantic search might fail in test environments due to model availability
-    // This is acceptable for integration tests
+    assert!(
+        output.status.success(),
+        "Semantic search failed: stderr: {}, stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("ai.txt"),
+        "Expected AI result, got: {stdout}"
+    );
 }
 
 #[test]
@@ -891,13 +896,7 @@ fn test_no_ckignore_flag_disables_hierarchical_ignore() {
 
 #[test]
 #[serial]
-#[ignore] // Requires models to be downloaded - run with: CK_MIXEDBREAD_MODELS_READY=1 cargo test -- --ignored
 fn test_mixedbread_index_and_search() {
-    // Skip if models aren't ready (set CK_MIXEDBREAD_MODELS_READY=1 to enable)
-    if std::env::var("CK_MIXEDBREAD_MODELS_READY").is_err() {
-        return;
-    }
-
     let temp_dir = TempDir::new().unwrap();
 
     // Create test files with semantic content
@@ -1012,12 +1011,7 @@ fn test_mixedbread_index_and_search() {
 
 #[test]
 #[serial]
-#[ignore] // Requires models to be downloaded
 fn test_switch_model_to_mixedbread() {
-    if std::env::var("CK_MIXEDBREAD_MODELS_READY").is_err() {
-        return;
-    }
-
     let temp_dir = TempDir::new().unwrap();
     fs::write(
         temp_dir.path().join("test.rs"),
