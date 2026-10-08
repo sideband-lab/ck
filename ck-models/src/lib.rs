@@ -257,6 +257,162 @@ impl RerankModelRegistry {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ModelRegistry, RerankModelRegistry};
+    use std::path::PathBuf;
+
+    #[test]
+    fn model_registry_resolves_every_alias_and_canonical_name() {
+        let registry = ModelRegistry::default();
+        let cases = [
+            ("bge-small", "BAAI/bge-small-en-v1.5", 384),
+            ("minilm", "sentence-transformers/all-MiniLM-L6-v2", 384),
+            ("nomic-v1.5", "nomic-embed-text-v1.5", 768),
+            ("jina-code", "jina-embeddings-v2-base-code", 768),
+            ("mxbai-xsmall", "mixedbread-ai/mxbai-embed-xsmall-v1", 384),
+        ];
+
+        assert_eq!(
+            registry.aliases(),
+            [
+                "bge-small",
+                "jina-code",
+                "minilm",
+                "mxbai-xsmall",
+                "nomic-v1.5"
+            ]
+        );
+        for (alias, canonical_name, dimensions) in cases {
+            let (resolved_alias, config) = registry.resolve(Some(alias)).unwrap();
+            assert_eq!(resolved_alias, alias);
+            assert_eq!(config.name, canonical_name);
+            assert_eq!(config.dimensions, dimensions);
+
+            let (canonical_alias, canonical_config) =
+                registry.resolve(Some(canonical_name)).unwrap();
+            assert_eq!(canonical_alias, alias);
+            assert_eq!(canonical_config.name, canonical_name);
+        }
+    }
+
+    #[test]
+    fn model_registry_uses_bge_small_as_default_and_rejects_unknown_models() {
+        let registry = ModelRegistry::default();
+        let (alias, config) = registry.resolve(None).unwrap();
+        assert_eq!(alias, "bge-small");
+        assert_eq!(config.name, "BAAI/bge-small-en-v1.5");
+
+        let error = registry
+            .resolve(Some("not-a-registered-model"))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Unknown model 'not-a-registered-model'"));
+        assert!(message.contains("bge-small"));
+    }
+
+    #[test]
+    fn model_registry_reports_a_missing_default_entry() {
+        let mut registry = ModelRegistry::default();
+        registry.default_model = "missing-default".to_string();
+
+        let error = registry.resolve(None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No default model configured in registry")
+        );
+    }
+
+    #[test]
+    fn model_registry_round_trips_and_loads_defaults_for_missing_files() {
+        let path = unique_test_path("registry.json");
+        let registry = ModelRegistry::default();
+        registry.save(&path).unwrap();
+
+        let loaded = ModelRegistry::load(&path).unwrap();
+        assert_eq!(loaded.aliases(), registry.aliases());
+        assert_eq!(
+            loaded.resolve(None).unwrap().1.name,
+            "BAAI/bge-small-en-v1.5"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let missing = ModelRegistry::load(&path).unwrap();
+        assert_eq!(missing.aliases(), registry.aliases());
+    }
+
+    #[test]
+    fn model_registry_rejects_malformed_json() {
+        let path = unique_test_path("broken-registry.json");
+        std::fs::write(&path, "{ malformed json").unwrap();
+
+        assert!(ModelRegistry::load(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rerank_registry_resolves_every_alias_and_canonical_name() {
+        let registry = RerankModelRegistry::default();
+        let cases = [
+            ("jina", "jina-reranker-v1-turbo-en", "fastembed"),
+            ("bge", "BAAI/bge-reranker-base", "fastembed"),
+            (
+                "mxbai",
+                "mixedbread-ai/mxbai-rerank-xsmall-v1",
+                "mixedbread",
+            ),
+        ];
+
+        assert_eq!(registry.aliases(), ["bge", "jina", "mxbai"]);
+        for (alias, canonical_name, provider) in cases {
+            let (resolved_alias, config) = registry.resolve(Some(alias)).unwrap();
+            assert_eq!(resolved_alias, alias);
+            assert_eq!(config.name, canonical_name);
+            assert_eq!(config.provider, provider);
+
+            let (canonical_alias, canonical_config) =
+                registry.resolve(Some(canonical_name)).unwrap();
+            assert_eq!(canonical_alias, alias);
+            assert_eq!(canonical_config.name, canonical_name);
+        }
+    }
+
+    #[test]
+    fn rerank_registry_uses_jina_by_default_and_rejects_unknown_models() {
+        let registry = RerankModelRegistry::default();
+        let (alias, config) = registry.resolve(None).unwrap();
+        assert_eq!(alias, "jina");
+        assert_eq!(config.name, "jina-reranker-v1-turbo-en");
+
+        let error = registry.resolve(Some("not-a-reranker")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown rerank model 'not-a-reranker'")
+        );
+    }
+
+    #[test]
+    fn rerank_registry_reports_a_missing_default_entry() {
+        let mut registry = RerankModelRegistry::default();
+        registry.default_model = "missing-default".to_string();
+
+        let error = registry.resolve(None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No default reranking model configured")
+        );
+    }
+
+    fn unique_test_path(filename: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ck-models-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(filename)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub model: String,
