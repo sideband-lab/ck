@@ -346,10 +346,109 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod path_scope_tests {
-    use super::PathScope;
+    use super::{PathScope, semantic_search_v3_with_progress};
+    use ck_core::{FileMetadata, SearchMode, SearchOptions, Span};
+    use ck_index::{ChunkEntry, IndexEntry, IndexManifest};
     use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn fixture(root: &Path) -> (String, Vec<f32>) {
+        let query = "database connection pool configuration".to_string();
+        let mut embedder = ck_embed::create_embedder(Some("minilm")).unwrap();
+        let vector = embedder
+            .embed(std::slice::from_ref(&query))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let index_dir = ck_core::index_dir(root);
+        fs::create_dir_all(&index_dir).unwrap();
+        let config = ck_models::ModelRegistry::default()
+            .resolve(Some("minilm"))
+            .unwrap()
+            .1;
+        let mut manifest = IndexManifest::default();
+        manifest.embedding_model = Some(config.name);
+        manifest.embedding_dimensions = Some(config.dimensions);
+        fs::write(
+            index_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        (query, vector)
+    }
+
+    fn write_chunk(root: &Path, relative: &str, content: &str, embedding: Vec<f32>) -> PathBuf {
+        let file = root.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, content).unwrap();
+        let entry = IndexEntry {
+            metadata: FileMetadata {
+                path: PathBuf::from(relative),
+                hash: "fixture-hash".to_string(),
+                last_modified: 0,
+                size: content.len() as u64,
+            },
+            chunks: vec![ChunkEntry {
+                span: Span::new(0, content.len(), 1, content.lines().count()).unwrap(),
+                embedding: Some(embedding),
+                chunk_type: None,
+                breadcrumb: None,
+                ancestry: None,
+                byte_length: Some(content.len()),
+                estimated_tokens: None,
+                leading_trivia: None,
+                trailing_trivia: None,
+                chunk_hash: None,
+            }],
+        };
+        let sidecar = ck_core::get_sidecar_path(root, &file);
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(sidecar, bincode::serialize(&entry).unwrap()).unwrap();
+        file
+    }
+
+    fn write_unembedded_chunk(root: &Path, relative: &str, content: &str) -> PathBuf {
+        let file = root.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, content).unwrap();
+        let entry = IndexEntry {
+            metadata: FileMetadata {
+                path: PathBuf::from(relative),
+                hash: "fixture-hash".to_string(),
+                last_modified: 0,
+                size: content.len() as u64,
+            },
+            chunks: vec![ChunkEntry {
+                span: Span::new(0, content.len(), 1, content.lines().count()).unwrap(),
+                embedding: None,
+                chunk_type: None,
+                breadcrumb: None,
+                ancestry: None,
+                byte_length: Some(content.len()),
+                estimated_tokens: None,
+                leading_trivia: None,
+                trailing_trivia: None,
+                chunk_hash: None,
+            }],
+        };
+        let sidecar = ck_core::get_sidecar_path(root, &file);
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(sidecar, bincode::serialize(&entry).unwrap()).unwrap();
+        file
+    }
+
+    fn options(root: &Path, query: String) -> SearchOptions {
+        SearchOptions {
+            mode: SearchMode::Semantic,
+            query,
+            path: root.to_path_buf(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn all_matches_anything() {
@@ -386,5 +485,162 @@ mod path_scope_tests {
         let scope = PathScope::new(&target);
         assert!(scope.contains(&target));
         assert!(!scope.contains(&other));
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[tokio::test]
+    async fn semantic_search_filters_before_top_k_and_reports_threshold_near_miss() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (query, vector) = fixture(root);
+        let inside = root.join("inside");
+        let matching = write_chunk(
+            root,
+            "inside/match.txt",
+            "database connection pool\nsecond detail\nthird detail\nfourth detail\n",
+            vec![0.0; vector.len()],
+        );
+        write_chunk(
+            root,
+            "inside/weak.txt",
+            "unrelated file\n",
+            vector.iter().map(|value| -*value).collect(),
+        );
+        write_chunk(root, "outside/match.txt", "outside match\n", vector);
+        let stale = write_chunk(root, "inside/stale.txt", "removed source\n", vec![0.0; 384]);
+        fs::remove_file(&stale).unwrap();
+
+        let mut search_options = options(&inside, query.clone());
+        search_options.top_k = Some(1);
+        search_options.threshold = Some(-0.1);
+        // The excluded outside chunk is an exact query-vector match while the
+        // in-scope chunk is orthogonal. It must be removed before top_k or it
+        // would displace the only in-scope result.
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.matches[0].file, matching);
+
+        // Include filtering independently happens before top_k as well.
+        search_options.path = root.to_path_buf();
+        search_options.include_patterns = vec![ck_core::IncludePattern {
+            path: matching.canonicalize().unwrap(),
+            is_dir: false,
+        }];
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.matches[0].file, matching);
+
+        search_options.path = inside.clone();
+        search_options.include_patterns.clear();
+        search_options.threshold = Some(0.5);
+        search_options.top_k = None;
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = messages.clone();
+        let callback: super::super::SearchProgressCallback = Box::new(move |message| {
+            collected.lock().unwrap().push(message.to_string());
+        });
+        let results = semantic_search_v3_with_progress(&search_options, Some(callback))
+            .await
+            .unwrap();
+
+        assert!(results.matches.is_empty());
+        assert!(results.closest_below_threshold.is_some());
+        assert!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.contains("Found 2 chunks with embeddings"))
+        );
+
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert!(results.matches.is_empty());
+        assert!(results.matches.iter().all(|result| result.file != stale));
+        assert!(results.closest_below_threshold.is_some());
+        assert!(results.closest_below_threshold.unwrap().score < 0.5);
+
+        search_options.full_section = true;
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert!(results.matches.is_empty());
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[tokio::test]
+    async fn semantic_search_handles_missing_corrupt_empty_and_model_mismatch_indexes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut search_options = options(root, "database connection pool configuration".into());
+        let missing = super::semantic_search_v3(&search_options)
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("Index creation failed"));
+
+        let (query, vector) = fixture(root);
+        search_options.query = query;
+        let index_dir = ck_core::index_dir(root);
+        fs::write(index_dir.join("broken.ck"), b"not a sidecar").unwrap();
+        let empty = super::semantic_search_v3(&search_options)
+            .await
+            .unwrap_err();
+        assert!(empty.to_string().contains("No embeddings found"));
+        fs::remove_file(index_dir.join("broken.ck")).unwrap();
+
+        let no_embedding = write_unembedded_chunk(root, "empty.txt", "no vector stored\n");
+        let empty = super::semantic_search_v3(&search_options)
+            .await
+            .unwrap_err();
+        assert!(empty.to_string().contains("No embeddings found"));
+        fs::remove_file(&no_embedding).unwrap();
+        fs::remove_file(ck_core::get_sidecar_path(root, &no_embedding)).unwrap();
+
+        write_chunk(root, "live.txt", "live source\n", vector);
+        search_options.embedding_model = Some("jina-code".into());
+        let mismatch = super::semantic_search_v3(&search_options)
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("Index was built with embedding model")
+        );
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[tokio::test]
+    async fn semantic_search_reranks_duplicate_previews_without_losing_file_association() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (query, vector) = fixture(root);
+        let preview = "database connection pool is configured";
+        let first = write_chunk(root, "a.txt", preview, vector.clone());
+        let second = write_chunk(root, "b.txt", preview, vector);
+        let mut search_options = options(root, query.clone());
+        search_options.rerank = true;
+        search_options.rerank_model = Some("mxbai".into());
+
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert_eq!(results.matches.len(), 2);
+        let files: std::collections::HashSet<_> = results
+            .matches
+            .iter()
+            .map(|result| result.file.clone())
+            .collect();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&first));
+        assert!(files.contains(&second));
+
+        let mut reranker = ck_embed::create_reranker(Some("mxbai")).unwrap();
+        let expected_scores = reranker
+            .rerank(&query, &[preview.to_string(), preview.to_string()])
+            .unwrap();
+        assert_eq!(expected_scores.len(), 2);
+        for result in &results.matches {
+            assert!(
+                (result.score - expected_scores[0].score).abs() < 1e-5,
+                "integrated score {} should match the real reranker score {}",
+                result.score,
+                expected_scores[0].score
+            );
+        }
     }
 }
