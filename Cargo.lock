@@ -455,6 +455,7 @@ name = "ck-engine"
 version = "0.7.11"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
  "ck-chunk",
  "ck-core",
