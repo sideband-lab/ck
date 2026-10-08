@@ -1153,6 +1153,27 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_chunk_hash_includes_text_and_both_trivia_fields() {
+        let text = "pub fn answer() -> i32 { 42 }";
+        let empty: Vec<String> = Vec::new();
+        let baseline = compute_chunk_hash(text, &empty, &empty);
+
+        assert_eq!(baseline, compute_chunk_hash(text, &empty, &empty));
+        assert_ne!(
+            baseline,
+            compute_chunk_hash("pub fn answer() -> i32 { 43 }", &empty, &empty)
+        );
+        assert_ne!(
+            baseline,
+            compute_chunk_hash(text, &["/// docs".to_string()], &empty)
+        );
+        assert_ne!(
+            baseline,
+            compute_chunk_hash(text, &empty, &["// trailing".to_string()])
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_get_sidecar_path_no_extension() {
         unsafe { std::env::remove_var(INDEX_DIR_ENV) };

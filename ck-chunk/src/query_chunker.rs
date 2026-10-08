@@ -344,6 +344,35 @@ mod tests {
     }
 
     #[test]
+    fn rust_query_chunks_keep_leading_doc_trivia_for_persistent_chunk_hashes() {
+        let source = "/// answer documentation\nfn answer() -> i32 { 42 }\n";
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Rust).expect("rust language");
+        parser
+            .set_language(&ts_language)
+            .expect("set rust language");
+        let tree = parser.parse(source, None).expect("parse rust source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Rust, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+        let function = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_type == ChunkType::Function && chunk.text.contains("fn answer")
+            })
+            .expect("function chunk");
+
+        assert!(
+            function
+                .metadata
+                .leading_trivia
+                .iter()
+                .any(|text| text.contains("answer documentation"))
+        );
+    }
+
+    #[test]
     fn python_queries_capture_core_constructs() {
         let source = r#"
 class Greeter:
