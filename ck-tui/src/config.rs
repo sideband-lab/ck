@@ -87,3 +87,30 @@ impl TuiConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_search_mode_round_trips_through_config() {
+        let mut config = TuiConfig::default();
+        config.search_mode = SearchMode::Semantic;
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["search_mode"], "semantic");
+
+        let decoded: TuiConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.search_mode, SearchMode::Semantic);
+        assert_eq!(decoded.preview_mode, PreviewMode::Heatmap);
+        assert!(decoded.full_file_mode);
+    }
+
+    #[test]
+    fn unknown_search_mode_defaults_to_semantic() {
+        let config: TuiConfig = serde_json::from_str(
+            r#"{"search_mode":"future-mode","preview_mode":"Syntax","full_file_mode":false}"#,
+        )
+        .unwrap();
+        assert_eq!(config.search_mode, SearchMode::Semantic);
+    }
+}

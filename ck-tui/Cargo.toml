@@ -32,3 +32,5 @@ default = ["fastembed", "mixedbread"]
 fastembed = ["ck-embed/fastembed", "ck-index/fastembed", "ck-chunk/fastembed", "ck-engine/fastembed"]
 mixedbread = ["ck-embed/mixedbread", "ck-index/mixedbread", "ck-chunk/mixedbread", "ck-engine/mixedbread"]
 
+[dev-dependencies]
+tempfile = { workspace = true }

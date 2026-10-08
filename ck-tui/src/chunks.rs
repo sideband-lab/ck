@@ -421,3 +421,55 @@ pub fn chunk_file_live(file_path: &Path) -> Result<(Vec<String>, Vec<IndexedChun
 
     Ok((lines, chunk_metas))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn live_chunking_returns_model_aware_metadata_and_source_lines() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("answer.rs");
+        fs::write(
+            &file,
+            "/// Returns the requested account.\npub fn find_account(id: u64) -> Option<Account> {\n    lookup(id)\n}\n",
+        )
+        .unwrap();
+
+        let (lines, chunks) = chunk_file_live(&file).unwrap();
+        assert_eq!(lines.len(), 4);
+        let function = chunks
+            .iter()
+            .find(|chunk| chunk.chunk_type.as_deref() == Some("function"))
+            .expect("live chunks should identify the function");
+        assert!(function.byte_length.unwrap() > 0);
+        assert!(function.estimated_tokens.unwrap() > 0);
+        assert!(
+            function
+                .leading_trivia
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|comment| comment.contains("requested account"))
+        );
+    }
+
+    #[test]
+    fn live_chunking_reports_missing_and_unreadable_files() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing.rs");
+        let missing_error = chunk_file_live(&missing)
+            .err()
+            .expect("missing file should fail");
+        assert!(missing_error.contains("File does not exist"));
+
+        let directory = temp.path().join("not-a-file.rs");
+        fs::create_dir(&directory).unwrap();
+        let directory_error = chunk_file_live(&directory)
+            .err()
+            .expect("directory path should not be readable as a file");
+        assert!(directory_error.contains("Could not read"));
+    }
+}
