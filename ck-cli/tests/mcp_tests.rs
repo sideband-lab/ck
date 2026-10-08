@@ -15,7 +15,7 @@ async fn test_mcp_semantic_search_basic_functionality() {
         query: "function".to_string(),
         path: temp_dir.path().to_string_lossy().to_string(),
         top_k: Some(10),
-        threshold: Some(0.1),
+        threshold: Some(0.0),
         cursor: None,
         page_size: Some(5),
         include_snippet: Some(true),
@@ -24,23 +24,105 @@ async fn test_mcp_semantic_search_basic_functionality() {
         ..Default::default()
     };
 
-    let result = server.handle_semantic_search(request, None, None).await;
+    let (summary, response) = server
+        .handle_semantic_search(request, None, None)
+        .await
+        .expect("MCP semantic search should succeed with a real embedding model");
+    assert!(summary.contains("Page 1"));
+    assert_eq!(response["search"]["mode"], "semantic");
+    assert!(response["search"].is_object());
+    assert!(response["results"]["matches"].is_array());
+    let matches = response["results"]["matches"].as_array().unwrap();
+    assert!(
+        !matches.is_empty(),
+        "semantic search should return a real match"
+    );
+    assert!(
+        response["metadata"]["fallback"].is_null(),
+        "semantic search should not silently report lexical fallback: {}",
+        response["metadata"]
+    );
+    assert!(response["pagination"].is_object());
+    assert!(response["pagination"]["current_page"].is_number());
+    assert!(response["results"]["count"].is_number());
+    assert!(response["results"]["has_more"].is_boolean());
+}
 
-    // Verify the result contains pagination information
-    if let Ok((summary, response)) = result {
-        assert!(summary.contains("Page 1"));
+#[tokio::test]
+async fn test_mcp_semantic_search_reindexes_unembedded_index() {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
 
-        // Verify response structure
-        assert!(response["search"].is_object());
-        assert!(response["results"].is_object());
-        assert!(response["pagination"].is_object());
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    let file = root.join("note.txt");
+    let content = "A unique phrase about database connection recovery.";
+    fs::write(&file, content).unwrap();
 
-        // Check pagination fields
-        assert!(response["pagination"]["current_page"].is_number());
-        assert!(response["results"]["count"].is_number());
-        assert!(response["results"]["has_more"].is_boolean());
-        assert_eq!(response["search"]["mode"], "semantic");
-    }
+    let relative = Path::new("note.txt");
+    let metadata = ck_core::FileMetadata {
+        path: relative.to_path_buf(),
+        hash: ck_core::compute_file_hash(&file).unwrap(),
+        last_modified: 0,
+        size: content.len() as u64,
+    };
+    let mut manifest = ck_index::IndexManifest::default();
+    manifest.embedding_model = Some("BAAI/bge-small-en-v1.5".to_string());
+    manifest.embedding_dimensions = Some(384);
+    manifest.files = HashMap::from([(relative.to_path_buf(), metadata.clone())]);
+
+    let index_dir = ck_core::index_dir(root);
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let sidecar = ck_index::IndexEntry {
+        metadata,
+        chunks: vec![ck_index::ChunkEntry {
+            span: ck_core::Span::new(0, content.len(), 1, 1).unwrap(),
+            embedding: None,
+            chunk_type: None,
+            breadcrumb: None,
+            ancestry: None,
+            byte_length: Some(content.len()),
+            estimated_tokens: None,
+            leading_trivia: None,
+            trailing_trivia: None,
+            chunk_hash: None,
+        }],
+    };
+    let sidecar_path = ck_core::get_sidecar_path(root, &file);
+    fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
+    fs::write(sidecar_path, bincode::serialize(&sidecar).unwrap()).unwrap();
+
+    let server = CkMcpServer::new(root.to_path_buf()).unwrap();
+    let request = SemanticSearchRequest {
+        query: "database connection recovery".to_string(),
+        path: root.to_string_lossy().to_string(),
+        threshold: Some(0.0),
+        ..Default::default()
+    };
+    let (_, response) = server
+        .handle_semantic_search(request, None, None)
+        .await
+        .expect("semantic search should rebuild an unembedded index");
+
+    assert!(
+        response["metadata"]["fallback"].is_null(),
+        "successful reindex should return semantic results, got: {}",
+        response["metadata"]
+    );
+    let indexing = &response["metadata"]["indexing"];
+    assert_eq!(indexing["triggered"], true);
+    assert!(indexing["files_indexed"].as_u64().unwrap() > 0);
+    let matches = response["results"]["matches"].as_array().unwrap();
+    assert!(
+        !matches.is_empty(),
+        "reindexed semantic results should match"
+    );
 }
 
 #[tokio::test]
@@ -99,25 +181,17 @@ async fn test_mcp_hybrid_search_basic_functionality() {
         ..Default::default()
     };
 
-    let result = server.handle_hybrid_search(request).await;
-
-    if let Ok((summary, response)) = result {
-        assert!(summary.contains("Page 1"));
-
-        // Verify hybrid-specific fields
-        assert_eq!(response["search"]["mode"], "hybrid");
-
-        // Check match structure for hybrid search
-        if let Some(matches) = response["results"]["matches"].as_array()
-            && !matches.is_empty()
-        {
-            let first_match = &matches[0];
-            assert_eq!(first_match["type"], "hybrid_match");
-            // Hybrid matches should have both score and rrf_score
-            assert!(first_match["match"]["score"].is_number());
-            assert!(first_match["match"]["rrf_score"].is_number());
-        }
-    }
+    let (summary, response) = server
+        .handle_hybrid_search(request)
+        .await
+        .expect("MCP hybrid search should succeed");
+    assert!(summary.contains("Page 1"));
+    assert_eq!(response["search"]["mode"], "hybrid");
+    let matches = response["results"]["matches"].as_array().unwrap();
+    assert!(!matches.is_empty(), "expected semantic or lexical matches");
+    assert_eq!(matches[0]["type"], "hybrid_match");
+    assert!(matches[0]["match"]["score"].is_number());
+    assert!(matches[0]["match"]["rrf_score"].is_number());
 }
 
 #[tokio::test]
@@ -162,13 +236,12 @@ async fn test_mcp_search_parameters_validation() {
         ..Default::default()
     };
 
-    let result = server.handle_semantic_search(request, None, None).await;
-
-    if let Ok((_, response)) = result {
-        // The actual page size in the response should be clamped
-        let page_size = response["pagination"]["page_size"].as_u64().unwrap_or(0);
-        assert!(page_size <= 200);
-    }
+    let (_, response) = server
+        .handle_semantic_search(request, None, None)
+        .await
+        .expect("MCP parameter validation should return a response");
+    let page_size = response["pagination"]["page_size"].as_u64().unwrap();
+    assert_eq!(page_size, 200);
 }
 
 #[tokio::test]
@@ -252,33 +325,14 @@ async fn test_mcp_top_k_page_size_interaction() {
         ..Default::default()
     };
 
-    let result = server.handle_semantic_search(request, None, None).await;
-    assert!(result.is_ok());
-
-    if let Ok((summary, response)) = result {
-        // Verify we get at most 3 results in first page
-        if let Some(matches) = response["results"]["matches"].as_array() {
-            let match_count = matches.len();
-            assert!(
-                match_count <= 3,
-                "First page should have at most 3 matches, got {match_count}"
-            );
-        }
-
-        // Check that we respect the top_k=5 setting
-        if let Some(total_count) = response["results"]["total_count"].as_u64() {
-            assert!(
-                total_count <= 5,
-                "Total count should respect top_k=5, got {total_count}"
-            );
-        }
-
-        // Check that summary reflects correct top_k
-        assert!(
-            summary.contains("top_k: 5"),
-            "Summary should show top_k: 5, got: {summary}"
-        );
-    }
+    let (summary, response) = server
+        .handle_semantic_search(request, None, None)
+        .await
+        .expect("first semantic page should succeed");
+    let matches = response["results"]["matches"].as_array().unwrap();
+    assert!(matches.len() <= 3);
+    assert!(response["results"]["total_count"].as_u64().unwrap() <= 5);
+    assert!(summary.contains("top_k: 5"));
 
     // Test case 2: top_k=2, page_size=10 should give us one page with 2 results max
     let request2 = SemanticSearchRequest {
@@ -294,30 +348,13 @@ async fn test_mcp_top_k_page_size_interaction() {
         ..Default::default()
     };
 
-    let result2 = server.handle_semantic_search(request2, None, None).await;
-    if let Ok((summary2, response2)) = result2 {
-        // Check that we respect the top_k=2 setting
-        if let Some(total_count) = response2["results"]["total_count"].as_u64() {
-            assert!(
-                total_count <= 2,
-                "Should respect top_k=2 limit, got {total_count} total"
-            );
-        }
-
-        if let Some(matches) = response2["results"]["matches"].as_array() {
-            let match_count = matches.len();
-            assert!(
-                match_count <= 2,
-                "Should respect top_k=2 limit, got {match_count} matches"
-            );
-        }
-
-        // Check that summary reflects correct top_k
-        assert!(
-            summary2.contains("top_k: 2"),
-            "Summary should show top_k: 2, got: {summary2}"
-        );
-    }
+    let (summary2, response2) = server
+        .handle_semantic_search(request2, None, None)
+        .await
+        .expect("second semantic page should succeed");
+    assert!(response2["results"]["total_count"].as_u64().unwrap() <= 2);
+    assert!(response2["results"]["matches"].as_array().unwrap().len() <= 2);
+    assert!(summary2.contains("top_k: 2"));
 }
 
 #[tokio::test]
@@ -341,9 +378,10 @@ async fn test_mcp_semantic_search_with_missing_files() {
         ..Default::default()
     };
 
-    let _ = server
+    server
         .handle_semantic_search(initial_request, None, None)
-        .await;
+        .await
+        .expect("initial indexing/search should succeed");
 
     // Now remove one of the test files to simulate a stale index
     let file_to_remove = temp_dir.path().join("test1.rs");
@@ -365,20 +403,12 @@ async fn test_mcp_semantic_search_with_missing_files() {
         ..Default::default()
     };
 
-    let result = server.handle_semantic_search(request, None, None).await;
-
-    // The search should succeed (not panic or error) even with missing file
-    assert!(
-        result.is_ok(),
-        "Search should succeed even with missing files"
-    );
-
-    if let Ok((summary, response)) = result {
-        // Should still get results from remaining files
-        assert!(response["results"]["matches"].is_array());
-        // The summary should not say "unlimited" since we set top_k
-        assert!(summary.contains("top_k: 20"));
-    }
+    let (summary, response) = server
+        .handle_semantic_search(request, None, None)
+        .await
+        .expect("semantic search should tolerate a stale sidecar");
+    assert!(response["results"]["matches"].is_array());
+    assert!(summary.contains("top_k: 20"));
 }
 
 #[tokio::test]
