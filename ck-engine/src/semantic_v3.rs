@@ -498,13 +498,13 @@ mod path_scope_tests {
             root,
             "inside/match.txt",
             "database connection pool\nsecond detail\nthird detail\nfourth detail\n",
-            vector.clone(),
+            vec![0.0; vector.len()],
         );
         write_chunk(
             root,
             "inside/weak.txt",
             "unrelated file\n",
-            vec![0.0; vector.len()],
+            vector.iter().map(|value| -*value).collect(),
         );
         write_chunk(root, "outside/match.txt", "outside match\n", vector);
         let stale = write_chunk(root, "inside/stale.txt", "removed source\n", vec![0.0; 384]);
@@ -512,11 +512,28 @@ mod path_scope_tests {
 
         let mut search_options = options(&inside, query.clone());
         search_options.top_k = Some(1);
-        search_options.threshold = Some(0.5);
+        search_options.threshold = Some(-0.1);
+        // The excluded outside chunk is an exact query-vector match while the
+        // in-scope chunk is orthogonal. It must be removed before top_k or it
+        // would displace the only in-scope result.
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.matches[0].file, matching);
+
+        // Include filtering independently happens before top_k as well.
+        search_options.path = root.to_path_buf();
         search_options.include_patterns = vec![ck_core::IncludePattern {
             path: matching.canonicalize().unwrap(),
             is_dir: false,
         }];
+        let results = super::semantic_search_v3(&search_options).await.unwrap();
+        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.matches[0].file, matching);
+
+        search_options.path = inside.clone();
+        search_options.include_patterns.clear();
+        search_options.threshold = Some(0.5);
+        search_options.top_k = None;
         let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected = messages.clone();
         let callback: super::super::SearchProgressCallback = Box::new(move |message| {
@@ -526,32 +543,25 @@ mod path_scope_tests {
             .await
             .unwrap();
 
-        assert_eq!(results.matches.len(), 1);
-        assert_eq!(results.matches[0].file, matching);
-        assert_eq!(
-            results.matches[0].preview,
-            "database connection pool\nsecond detail\nthird detail"
-        );
-        assert!(results.closest_below_threshold.is_none());
+        assert!(results.matches.is_empty());
+        assert!(results.closest_below_threshold.is_some());
         assert!(
             messages
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|m| m.contains("Found 1 chunks"))
+                .any(|m| m.contains("Found 2 chunks with embeddings"))
         );
 
-        search_options.include_patterns.clear();
-        search_options.top_k = None;
         let results = super::semantic_search_v3(&search_options).await.unwrap();
-        assert_eq!(results.matches.len(), 1);
+        assert!(results.matches.is_empty());
         assert!(results.matches.iter().all(|result| result.file != stale));
         assert!(results.closest_below_threshold.is_some());
         assert!(results.closest_below_threshold.unwrap().score < 0.5);
 
         search_options.full_section = true;
         let results = super::semantic_search_v3(&search_options).await.unwrap();
-        assert!(results.matches[0].preview.contains("fourth detail"));
+        assert!(results.matches.is_empty());
     }
 
     #[cfg(feature = "fastembed")]
@@ -604,7 +614,7 @@ mod path_scope_tests {
         let preview = "database connection pool is configured";
         let first = write_chunk(root, "a.txt", preview, vector.clone());
         let second = write_chunk(root, "b.txt", preview, vector);
-        let mut search_options = options(root, query);
+        let mut search_options = options(root, query.clone());
         search_options.rerank = true;
         search_options.rerank_model = Some("mxbai".into());
 
@@ -618,5 +628,19 @@ mod path_scope_tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&first));
         assert!(files.contains(&second));
+
+        let mut reranker = ck_embed::create_reranker(Some("mxbai")).unwrap();
+        let expected_scores = reranker
+            .rerank(&query, &[preview.to_string(), preview.to_string()])
+            .unwrap();
+        assert_eq!(expected_scores.len(), 2);
+        for result in &results.matches {
+            assert!(
+                (result.score - expected_scores[0].score).abs() < 1e-5,
+                "integrated score {} should match the real reranker score {}",
+                result.score,
+                expected_scores[0].score
+            );
+        }
     }
 }
