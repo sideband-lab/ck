@@ -408,3 +408,139 @@ fn download_assets(
 
     Ok((model, tokenizer))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MixedbreadEmbedder, MixedbreadReranker, normalize_row};
+    use crate::{Embedder, Reranker};
+    use ck_models::{ModelRegistry, RerankModelRegistry};
+    use ndarray::{Array3, ArrayD, IxDyn, array};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn normalization_handles_two_and_three_dimensional_tensors() {
+        let two_dimensional = array![[3.0_f32, 4.0], [0.0, 0.0]].into_dyn();
+        let normalized = MixedbreadEmbedder::normalize(two_dimensional.view(), 3).unwrap();
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0], [0.6, 0.8, 0.0]);
+        assert_eq!(normalized[1], [0.0, 0.0, 0.0]);
+
+        let three_dimensional = Array3::from_shape_vec(
+            (2, 2, 2),
+            vec![3.0_f32, 4.0, 99.0, 99.0, 0.0, 0.0, 99.0, 99.0],
+        )
+        .unwrap()
+        .into_dyn();
+        let normalized = MixedbreadEmbedder::normalize(three_dimensional.view(), 2).unwrap();
+        assert_eq!(normalized, [vec![0.6, 0.8], vec![0.0, 0.0]]);
+    }
+
+    #[test]
+    fn normalization_rejects_unexpected_rank_and_pads_or_trims_dimensions() {
+        let one_dimensional = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0_f32, 2.0]).unwrap();
+        assert!(MixedbreadEmbedder::normalize(one_dimensional.view(), 2).is_err());
+
+        let trimmed = normalize_row(array![3.0_f32, 4.0, 12.0].view(), 2);
+        assert_eq!(trimmed, [0.6, 0.8]);
+        let padded = normalize_row(array![3.0_f32, 4.0].view(), 3);
+        assert_eq!(padded, [0.6, 0.8, 0.0]);
+    }
+
+    #[test]
+    fn mixedbread_embedder_runs_inference_and_handles_empty_ragged_and_truncated_inputs() {
+        let (_, config) = ModelRegistry::default()
+            .resolve(Some("mxbai-xsmall"))
+            .unwrap();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let messages_copy = Arc::clone(&messages);
+        let mut embedder = MixedbreadEmbedder::new(
+            &config,
+            Some(Box::new(move |message| {
+                messages_copy.lock().unwrap().push(message.to_string());
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(embedder.id(), "mixedbread");
+        assert_eq!(embedder.model_name(), config.name);
+        assert!(messages.lock().unwrap().len() >= 2);
+        assert!(embedder.embed(&[]).unwrap().is_empty());
+
+        let texts = [
+            "A longer explanation about safe error handling in Rust.".to_string(),
+            "short".to_string(),
+        ];
+        let (input_ids, attention_mask, token_type_ids) = embedder.build_inputs(&texts).unwrap();
+        assert_eq!(input_ids.shape()[0], 2);
+        assert_eq!(attention_mask.shape(), input_ids.shape());
+        assert!(attention_mask.row(1).iter().any(|value| *value == 0));
+        assert_eq!(token_type_ids.is_some(), embedder.requires_token_type_ids);
+        if let Some(token_type_ids) = token_type_ids {
+            assert_eq!(token_type_ids.shape(), input_ids.shape());
+        }
+
+        let embeddings = embedder.embed(&texts).unwrap();
+        assert_eq!(embeddings.len(), 2);
+        assert!(
+            embeddings
+                .iter()
+                .all(|vector| vector.len() == config.dimensions)
+        );
+        assert!(embeddings.iter().flatten().all(|value| value.is_finite()));
+
+        embedder.max_length = 4;
+        let long_input = ["word ".repeat(30)];
+        let (input_ids, attention_mask, _) = embedder.build_inputs(&long_input).unwrap();
+        assert_eq!(input_ids.shape(), [1, 4]);
+        assert_eq!(attention_mask.shape(), [1, 4]);
+    }
+
+    #[test]
+    fn mixedbread_reranker_runs_inference_and_handles_empty_and_ragged_documents() {
+        let (_, config) = RerankModelRegistry::default()
+            .resolve(Some("mxbai"))
+            .unwrap();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let messages_copy = Arc::clone(&messages);
+        let mut reranker = MixedbreadReranker::new(
+            &config,
+            Some(Box::new(move |message| {
+                messages_copy.lock().unwrap().push(message.to_string());
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(reranker.id(), "mixedbread_reranker");
+        assert!(messages.lock().unwrap().len() >= 2);
+        assert!(reranker.rerank("query", &[]).unwrap().is_empty());
+
+        let query = "Rust error handling";
+        let documents = [
+            "Rust's Result type carries errors to callers.".to_string(),
+            "A short unrelated CSS note.".to_string(),
+        ];
+        let (input_ids, attention_mask, token_type_ids) =
+            reranker.build_inputs(query, &documents).unwrap();
+        assert_eq!(input_ids.shape()[0], 2);
+        assert_eq!(attention_mask.shape(), input_ids.shape());
+        assert_eq!(token_type_ids.is_some(), reranker.requires_token_type_ids);
+        if let Some(token_type_ids) = token_type_ids {
+            assert_eq!(token_type_ids.shape(), input_ids.shape());
+        }
+
+        let results = reranker.rerank(query, &documents).unwrap();
+        assert_eq!(results.len(), documents.len());
+        for (result, document) in results.iter().zip(&documents) {
+            assert_eq!(result.query, query);
+            assert_eq!(&result.document, document);
+            assert!(result.score.is_finite());
+        }
+
+        reranker.max_length = 4;
+        let (input_ids, attention_mask, _) = reranker
+            .build_inputs(query, &["a longer document ".repeat(30)])
+            .unwrap();
+        assert_eq!(input_ids.shape()[1], 4);
+        assert_eq!(attention_mask.shape(), [1, 4]);
+    }
+}

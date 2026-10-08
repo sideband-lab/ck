@@ -260,40 +260,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_create_reranker_rejects_unknown_alias() {
+        let error = create_reranker(Some("not-a-reranker")).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown rerank model 'not-a-reranker'")
+        );
+    }
+
+    #[cfg(all(feature = "fastembed", feature = "mixedbread"))]
+    #[test]
+    fn every_registered_alias_constructs_and_reranks_documents() {
+        let registry = RerankModelRegistry::default();
+        let query = "Rust error handling with Result";
+        let documents = vec![
+            "Rust uses Result and Option for error handling.".to_string(),
+            "CSS controls colors and layout in a web page.".to_string(),
+        ];
+
+        for alias in registry.aliases() {
+            let mut reranker = create_reranker(Some(&alias))
+                .unwrap_or_else(|error| panic!("failed to initialize '{alias}': {error:#}"));
+            assert_eq!(
+                reranker.id(),
+                if alias == "mxbai" {
+                    "mixedbread_reranker"
+                } else {
+                    "fastembed_reranker"
+                }
+            );
+
+            let results = reranker
+                .rerank(query, &documents)
+                .unwrap_or_else(|error| panic!("'{alias}' inference failed: {error:#}"));
+            assert_eq!(results.len(), documents.len(), "alias {alias}");
+            for result in results {
+                assert_eq!(result.query, query, "alias {alias}");
+                assert!(documents.contains(&result.document), "alias {alias}");
+                assert!(result.score.is_finite(), "alias {alias}");
+            }
+
+            assert!(
+                reranker.rerank(query, &[]).unwrap().is_empty(),
+                "alias {alias}"
+            );
+        }
+    }
+
     #[cfg(feature = "fastembed")]
     #[test]
-    fn test_fastembed_reranker_creation() {
-        // This test requires downloading models, so we'll skip it in CI
-        if std::env::var("CI").is_ok() {
-            return;
-        }
+    fn direct_bge_constructor_runs_real_inference() {
+        let mut reranker = FastReranker::new("bge-reranker-base").unwrap();
+        let results = reranker
+            .rerank(
+                "Rust error handling",
+                &["Result and Option".to_string(), "CSS layout".to_string()],
+            )
+            .unwrap();
 
-        let reranker = FastReranker::new("jina-reranker-v1-turbo-en");
-
-        match reranker {
-            Ok(mut reranker) => {
-                assert_eq!(reranker.id(), "fastembed_reranker");
-
-                let query = "error handling";
-                let documents = vec![
-                    "try catch exception handling".to_string(),
-                    "user interface design".to_string(),
-                ];
-
-                let result = reranker.rerank(query, &documents);
-                assert!(result.is_ok());
-
-                let results = result.unwrap();
-                assert_eq!(results.len(), 2);
-
-                // First result should be more relevant to query
-                assert!(results[0].score > results[1].score);
-            }
-            Err(_) => {
-                // In test environments, FastEmbed might not be available
-                // This is acceptable for unit tests
-            }
-        }
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.score.is_finite()));
     }
 
     #[test]

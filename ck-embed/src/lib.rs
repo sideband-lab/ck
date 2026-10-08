@@ -328,59 +328,96 @@ mod tests {
         assert_eq!(embeddings[0].len(), 384);
     }
 
-    #[cfg(feature = "fastembed")]
     #[test]
-    fn test_fastembed_creation() {
-        // This test requires downloading models, so we'll skip it in CI
-        if std::env::var("CI").is_ok() {
-            return;
-        }
+    fn test_create_embedder_rejects_unknown_alias() {
+        let error = create_embedder(Some("not-a-model-alias")).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown model 'not-a-model-alias'")
+        );
+    }
 
-        let embedder = FastEmbedder::new("BAAI/bge-small-en-v1.5");
+    #[test]
+    fn test_create_embedder_rejects_unknown_provider() {
+        let config = ModelConfig {
+            name: "test-model".to_string(),
+            provider: "unknown-provider".to_string(),
+            dimensions: 8,
+            max_tokens: 16,
+            description: "test configuration".to_string(),
+        };
 
-        // FastEmbed creation might fail due to network issues or missing models
-        // In a real test environment, you'd want to ensure models are available
-        match embedder {
-            Ok(mut embedder) => {
-                assert_eq!(embedder.id(), "fastembed");
-                assert_eq!(embedder.dim(), 384);
+        let error = create_embedder_for_config(&config, None).err().unwrap();
+        assert!(error.to_string().contains("Unsupported embedding provider"));
+    }
 
-                let texts = vec!["hello world".to_string()];
-                let result = embedder.embed(&texts);
-                assert!(result.is_ok());
+    #[cfg(all(feature = "fastembed", feature = "mixedbread"))]
+    #[test]
+    fn every_registered_alias_constructs_and_embeds_ragged_inputs() {
+        use std::sync::{Arc, Mutex};
 
-                let embeddings = result.unwrap();
-                assert_eq!(embeddings.len(), 1);
-                assert_eq!(embeddings[0].len(), 384);
+        let registry = ModelRegistry::default();
+        let texts = [
+            "Rust errors use Result and Option for explicit recovery.".to_string(),
+            "A very short query.".to_string(),
+        ];
 
-                // Real embeddings should not be all zeros
-                assert!(!embeddings[0].iter().all(|&x| x == 0.0));
-            }
-            Err(_) => {
-                // In test environments, FastEmbed might not be available
-                // This is acceptable for unit tests
+        for alias in registry.aliases() {
+            let config = registry.get_model(&alias).unwrap();
+            let progress = Arc::new(Mutex::new(Vec::new()));
+            let progress_copy = Arc::clone(&progress);
+            let mut embedder = create_embedder_with_progress(
+                Some(&alias),
+                Some(Box::new(move |message| {
+                    progress_copy.lock().unwrap().push(message.to_string());
+                })),
+            )
+            .unwrap_or_else(|error| panic!("failed to initialize '{alias}': {error:#}"));
+
+            assert_eq!(embedder.model_name(), config.name, "alias {alias}");
+            assert_eq!(embedder.dim(), config.dimensions, "alias {alias}");
+            assert!(!progress.lock().unwrap().is_empty(), "alias {alias}");
+
+            let embeddings = embedder
+                .embed(&texts)
+                .unwrap_or_else(|error| panic!("'{alias}' inference failed: {error:#}"));
+            assert_eq!(embeddings.len(), texts.len(), "alias {alias}");
+            for embedding in embeddings {
+                assert_eq!(embedding.len(), config.dimensions, "alias {alias}");
+                assert!(
+                    embedding.iter().all(|value| value.is_finite()),
+                    "alias {alias}"
+                );
+                assert!(embedding.iter().any(|value| *value != 0.0), "alias {alias}");
             }
         }
     }
 
-    #[cfg(feature = "fastembed")]
+    #[cfg(not(feature = "fastembed"))]
     #[test]
-    fn test_create_embedder_fastembed() {
-        if std::env::var("CI").is_ok() {
-            return;
-        }
+    fn fastembed_provider_fallback_reports_progress_and_uses_dummy_embedder() {
+        use std::sync::{Arc, Mutex};
 
-        let embedder = create_embedder(Some("BAAI/bge-small-en-v1.5"));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let messages_copy = Arc::clone(&messages);
+        let embedder = create_embedder_with_progress(
+            Some("bge-small"),
+            Some(Box::new(move |message| {
+                messages_copy.lock().unwrap().push(message.to_string());
+            })),
+        )
+        .unwrap();
 
-        match embedder {
-            Ok(embedder) => {
-                assert_eq!(embedder.id(), "fastembed");
-                assert_eq!(embedder.dim(), 384);
-            }
-            Err(_) => {
-                // Model might not be available in test environment
-            }
-        }
+        assert_eq!(embedder.id(), "dummy");
+        assert_eq!(embedder.model_name(), "BAAI/bge-small-en-v1.5");
+        assert!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("using dummy embedder"))
+        );
     }
 
     #[test]

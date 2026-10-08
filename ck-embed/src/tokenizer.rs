@@ -116,6 +116,22 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_tokens_unicode_and_mixed_content() {
+        let unicode = "こんにちは、世界 🌍";
+        assert_eq!(
+            TokenEstimator::estimate_tokens(unicode),
+            (unicode.chars().count() as f32 / 4.8).ceil() as usize
+        );
+
+        // One code indicator across several lines selects the mixed-content ratio.
+        let mixed = "A {\nA short explanation\nAnother sentence\nOne more line";
+        assert_eq!(
+            TokenEstimator::estimate_tokens(mixed),
+            (mixed.chars().count() as f32 / 4.4).ceil() as usize
+        );
+    }
+
+    #[test]
     fn test_estimate_tokens_code() {
         let code = r#"
 fn main() {
