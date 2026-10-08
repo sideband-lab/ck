@@ -32,10 +32,97 @@ async fn test_mcp_semantic_search_basic_functionality() {
     assert_eq!(response["search"]["mode"], "semantic");
     assert!(response["search"].is_object());
     assert!(response["results"]["matches"].is_array());
+    let matches = response["results"]["matches"].as_array().unwrap();
+    assert!(
+        !matches.is_empty(),
+        "semantic search should return a real match"
+    );
+    assert!(
+        response["metadata"]["fallback"].is_null(),
+        "semantic search should not silently report lexical fallback: {}",
+        response["metadata"]
+    );
     assert!(response["pagination"].is_object());
     assert!(response["pagination"]["current_page"].is_number());
     assert!(response["results"]["count"].is_number());
     assert!(response["results"]["has_more"].is_boolean());
+}
+
+#[tokio::test]
+async fn test_mcp_semantic_search_reindexes_unembedded_index() {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    let file = root.join("note.txt");
+    let content = "A unique phrase about database connection recovery.";
+    fs::write(&file, content).unwrap();
+
+    let relative = Path::new("note.txt");
+    let metadata = ck_core::FileMetadata {
+        path: relative.to_path_buf(),
+        hash: ck_core::compute_file_hash(&file).unwrap(),
+        last_modified: 0,
+        size: content.len() as u64,
+    };
+    let mut manifest = ck_index::IndexManifest::default();
+    manifest.embedding_model = Some("BAAI/bge-small-en-v1.5".to_string());
+    manifest.embedding_dimensions = Some(384);
+    manifest.files = HashMap::from([(relative.to_path_buf(), metadata.clone())]);
+
+    let index_dir = ck_core::index_dir(root);
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let sidecar = ck_index::IndexEntry {
+        metadata,
+        chunks: vec![ck_index::ChunkEntry {
+            span: ck_core::Span::new(0, content.len(), 1, 1).unwrap(),
+            embedding: None,
+            chunk_type: None,
+            breadcrumb: None,
+            ancestry: None,
+            byte_length: Some(content.len()),
+            estimated_tokens: None,
+            leading_trivia: None,
+            trailing_trivia: None,
+            chunk_hash: None,
+        }],
+    };
+    let sidecar_path = ck_core::get_sidecar_path(root, &file);
+    fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
+    fs::write(sidecar_path, bincode::serialize(&sidecar).unwrap()).unwrap();
+
+    let server = CkMcpServer::new(root.to_path_buf()).unwrap();
+    let request = SemanticSearchRequest {
+        query: "database connection recovery".to_string(),
+        path: root.to_string_lossy().to_string(),
+        threshold: Some(0.0),
+        ..Default::default()
+    };
+    let (_, response) = server
+        .handle_semantic_search(request, None, None)
+        .await
+        .expect("semantic search should rebuild an unembedded index");
+
+    assert!(
+        response["metadata"]["fallback"].is_null(),
+        "successful reindex should return semantic results, got: {}",
+        response["metadata"]
+    );
+    let indexing = &response["metadata"]["indexing"];
+    assert_eq!(indexing["triggered"], true);
+    assert!(indexing["files_indexed"].as_u64().unwrap() > 0);
+    let matches = response["results"]["matches"].as_array().unwrap();
+    assert!(
+        !matches.is_empty(),
+        "reindexed semantic results should match"
+    );
 }
 
 #[tokio::test]

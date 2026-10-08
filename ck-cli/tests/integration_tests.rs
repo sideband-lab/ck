@@ -992,6 +992,7 @@ fn test_mixedbread_index_and_search() {
             "--rerank",
             "--rerank-model",
             "mxbai",
+            "--json",
             ".",
         ])
         .current_dir(temp_dir.path())
@@ -1006,7 +1007,35 @@ fn test_mixedbread_index_and_search() {
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(!stdout.is_empty(), "Should return results");
+    let results: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("reranked JSON result should parse"))
+        .collect();
+    assert!(!results.is_empty(), "Should return results");
+
+    let query = "error handling";
+    let previews: Vec<String> = results
+        .iter()
+        .map(|result| result["preview"].as_str().unwrap().to_string())
+        .collect();
+    let mut reranker = ck_embed::create_reranker(Some("mxbai")).unwrap();
+    let expected_scores = reranker.rerank(query, &previews).unwrap();
+    assert_eq!(expected_scores.len(), results.len());
+    for result in &results {
+        let actual = result["score"]
+            .as_f64()
+            .expect("JSON result should expose score");
+        let preview = result["preview"].as_str().unwrap();
+        let expected = expected_scores
+            .iter()
+            .find(|score| score.document == preview)
+            .expect("reranker should score every CLI preview")
+            .score;
+        assert!(
+            (actual - f64::from(expected)).abs() < 1e-5,
+            "CLI score {actual} should match real reranker score {expected}"
+        );
+    }
 }
 
 #[test]

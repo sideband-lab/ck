@@ -71,3 +71,4 @@ vendored-openssl = ["openssl?/vendored"]
 [dev-dependencies]
 tempfile = { workspace = true }
 serial_test = "2.0"
+bincode = { workspace = true }

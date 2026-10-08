@@ -515,6 +515,7 @@ version = "0.7.11"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bincode",
  "chrono",
  "ck-chunk",
  "ck-core",
