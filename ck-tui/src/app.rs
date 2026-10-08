@@ -989,3 +989,75 @@ impl TuiApp {
         std::process::exit(0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ck_core::SearchMode;
+    use ratatui::backend::TestBackend;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn semantic_search_updates_results_history_progress_and_preview_state() {
+        let temp = TempDir::new().unwrap();
+        let source =
+            "The function handles account lookup and returns the matching account record.\n";
+        std::fs::write(temp.path().join("account.txt"), source).unwrap();
+
+        let mut app = TuiApp::new(temp.path().to_path_buf(), Some(source.trim().to_string()));
+        app.state.mode = SearchMode::Semantic;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.start_search(&mut terminal).unwrap();
+
+        assert!(app.state.search_in_progress);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.state.search_in_progress && Instant::now() < deadline {
+            app.pump_progress_events();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        app.pump_progress_events();
+
+        assert!(
+            !app.state.search_in_progress,
+            "semantic search did not complete"
+        );
+        assert!(
+            !app.state.results.is_empty(),
+            "semantic search returned no results"
+        );
+        assert!(
+            app.state
+                .search_history
+                .contains(&source.trim().to_string())
+        );
+        assert!(app.state.status_message.starts_with("Found "));
+        assert!(app.state.preview_cache.is_some());
+        assert!(!app.state.indexing_active);
+        assert!(temp.path().join(".ck/manifest.json").exists());
+    }
+
+    #[test]
+    fn semantic_indexing_progress_events_update_and_clear_state() {
+        let temp = TempDir::new().unwrap();
+        let mut app = TuiApp::new(temp.path().to_path_buf(), None);
+
+        app.handle_progress_event(crate::events::UiEvent::Indexing {
+            generation: 0,
+            message: "account.txt • 1/1 files • 1/2 chunks".to_string(),
+            progress: Some(0.5),
+        });
+        assert!(app.state.indexing_active);
+        assert_eq!(
+            app.state.indexing_message.as_deref(),
+            Some("account.txt • 1/1 files • 1/2 chunks")
+        );
+        assert_eq!(app.state.indexing_progress, Some(0.5));
+
+        app.handle_progress_event(crate::events::UiEvent::IndexingDone { generation: 0 });
+        assert!(!app.state.indexing_active);
+        assert!(app.state.indexing_message.is_none());
+        assert!(app.state.indexing_progress.is_none());
+    }
+}

@@ -571,6 +571,7 @@ dependencies = [
  "serde_json",
  "shlex 2.0.1",
  "syntect",
+ "tempfile",
  "tokio",
 ]
 
