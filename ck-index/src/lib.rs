@@ -1814,6 +1814,43 @@ mod tests {
         }
     }
 
+    struct CountingEmbedder {
+        dim: usize,
+        calls: usize,
+    }
+
+    fn counting_embedder(dim: usize) -> Box<dyn ck_embed::Embedder> {
+        Box::new(CountingEmbedder { dim, calls: 0 })
+    }
+
+    impl ck_embed::Embedder for CountingEmbedder {
+        fn id(&self) -> &'static str {
+            "counting-test"
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn model_name(&self) -> &str {
+            "test-cache-model"
+        }
+
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls += texts.len();
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let mut vector = vec![0.0; self.dim];
+                    if !vector.is_empty() {
+                        vector[0] = text.len() as f32;
+                    }
+                    vector
+                })
+                .collect())
+        }
+    }
+
     #[test]
     fn test_index_single_file_handles_empty_embedding_results() {
         let temp_dir = TempDir::new().unwrap();
@@ -1920,6 +1957,138 @@ mod tests {
             assert!(chunk.embedding.is_some());
             assert_eq!(chunk.embedding.as_ref().unwrap().len(), 384); // DummyEmbedder dimension
         }
+    }
+
+    #[test]
+    fn test_unembedded_sidecar_round_trip_keeps_chunks_without_vectors() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let file = root.join("plain.txt");
+        fs::write(&file, "A source file indexed without embedding vectors.").unwrap();
+
+        let entry = index_single_file(&file, root, None).unwrap();
+        assert!(!entry.chunks.is_empty());
+        assert!(entry.chunks.iter().all(|chunk| chunk.embedding.is_none()));
+
+        let sidecar = get_sidecar_path(root, &file);
+        save_index_entry(&sidecar, &entry).unwrap();
+        let restored = load_index_entry(&sidecar).unwrap();
+        assert_eq!(restored.chunks.len(), entry.chunks.len());
+        assert!(
+            restored
+                .chunks
+                .iter()
+                .all(|chunk| chunk.embedding.is_none())
+        );
+    }
+
+    #[test]
+    fn test_embedding_sidecar_reuses_unchanged_chunks_and_invalidates_content_and_trivia() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let file = root.join("sample.rs");
+        fs::write(&file, "/// original docs\npub fn answer() -> i32 { 42 }\n").unwrap();
+        let sidecar = get_sidecar_path(root, &file);
+        let mut embedder = counting_embedder(2);
+        let (first, first_reused, first_embedded) =
+            index_single_file_with_progress(&file, root, Some(&mut embedder), None, 0, 1).unwrap();
+        // Persist the first result just as the directory indexer does.
+        save_index_entry(&sidecar, &first).unwrap();
+        assert_eq!(first_reused, 0);
+        assert!(first_embedded > 0);
+
+        let mut embedder = counting_embedder(2);
+        let (unchanged, reused, embedded) =
+            index_single_file_with_progress(&file, root, Some(&mut embedder), None, 0, 1).unwrap();
+        assert_eq!(reused, first.chunks.len());
+        assert_eq!(embedded, 0);
+        assert!(
+            unchanged
+                .chunks
+                .iter()
+                .all(|chunk| chunk.embedding.is_some())
+        );
+        save_index_entry(&sidecar, &unchanged).unwrap();
+
+        fs::write(&file, "/// original docs\npub fn answer() -> i32 { 43 }\n").unwrap();
+        let mut embedder = counting_embedder(2);
+        let (content_changed, reused, embedded) =
+            index_single_file_with_progress(&file, root, Some(&mut embedder), None, 0, 1).unwrap();
+        assert_eq!(reused, 0);
+        assert!(embedded > 0);
+        save_index_entry(&sidecar, &content_changed).unwrap();
+
+        fs::write(&file, "/// updated docs\npub fn answer() -> i32 { 43 }\n").unwrap();
+        let mut embedder = counting_embedder(2);
+        let (_, reused, embedded) =
+            index_single_file_with_progress(&file, root, Some(&mut embedder), None, 0, 1).unwrap();
+        assert_eq!(reused, 0, "trivia changes must invalidate cached vectors");
+        assert!(embedded > 0);
+    }
+
+    #[test]
+    fn test_embedding_sidecar_reembeds_cached_dimension_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let file = root.join("sample.txt");
+        fs::write(&file, "A short paragraph with enough text to form a chunk.").unwrap();
+        let sidecar = get_sidecar_path(root, &file);
+
+        let mut embedder = counting_embedder(2);
+        let (first, _, _) =
+            index_single_file_with_progress(&file, root, Some(&mut embedder), None, 0, 1).unwrap();
+        save_index_entry(&sidecar, &first).unwrap();
+
+        let mut embedder = counting_embedder(3);
+        let (updated, reused, embedded) =
+            index_single_file_with_progress(&file, root, Some(&mut embedder), None, 0, 1).unwrap();
+        assert_eq!(reused, 0);
+        assert_eq!(embedded, updated.chunks.len());
+        assert!(updated.chunks.iter().all(|chunk| {
+            chunk
+                .embedding
+                .as_ref()
+                .is_some_and(|vector| vector.len() == 3)
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_real_embedding_persisted_round_trip_records_model_and_dimensions() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let file = root.join("embedding.txt");
+        fs::write(
+            &file,
+            "A persisted embedding should survive serialization and be associated with its source text.",
+        )
+        .unwrap();
+        let options = ck_core::FileCollectionOptions::default();
+
+        index_directory(root, true, &options, Some("minilm"))
+            .await
+            .unwrap();
+
+        let manifest =
+            load_or_create_manifest(&ck_core::index_dir(root).join("manifest.json")).unwrap();
+        let expected = ck_models::ModelRegistry::default()
+            .resolve(Some("minilm"))
+            .unwrap()
+            .1;
+        assert_eq!(
+            manifest.embedding_model.as_deref(),
+            Some(expected.name.as_str())
+        );
+        assert_eq!(manifest.embedding_dimensions, Some(expected.dimensions));
+
+        let sidecar = load_index_entry(&get_sidecar_path(root, &file)).unwrap();
+        assert_eq!(sidecar.chunks.len(), 1);
+        let vector = sidecar.chunks[0].embedding.as_ref().unwrap();
+        assert_eq!(vector.len(), expected.dimensions);
+        assert!(
+            vector
+                .iter()
+                .any(|value| value.is_finite() && *value != 0.0)
+        );
     }
 
     #[tokio::test]

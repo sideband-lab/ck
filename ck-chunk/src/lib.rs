@@ -2195,6 +2195,37 @@ fn merge_group(group: &[Chunk], text: &str) -> Chunk {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_aware_chunk_config_selects_small_and_large_context_targets() {
+        assert_eq!(get_model_chunk_config(None), (1024, 200));
+        assert_eq!(
+            get_model_chunk_config(Some("BAAI/bge-small-en-v1.5")),
+            (400, 80)
+        );
+        assert_eq!(
+            get_model_chunk_config(Some("sentence-transformers/all-MiniLM-L6-v2")),
+            (400, 80)
+        );
+        assert_eq!(
+            get_model_chunk_config(Some("jina-embeddings-v2-base-code")),
+            (1024, 200)
+        );
+        assert_eq!(
+            get_model_chunk_config(Some("unregistered-model")),
+            (1024, 200)
+        );
+
+        let source = (0..75)
+            .map(|line| format!("Paragraph line {line} has useful semantic content."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let small_model =
+            chunk_text_with_model(&source, None, Some("BAAI/bge-small-en-v1.5")).unwrap();
+        let large_model =
+            chunk_text_with_model(&source, None, Some("nomic-embed-text-v1.5")).unwrap();
+        assert!(small_model.len() > large_model.len());
+    }
+
     fn canonicalize_spans(
         mut spans: Vec<(usize, usize, ChunkType)>,
     ) -> Vec<(usize, usize, ChunkType)> {
